@@ -1,28 +1,21 @@
-name: RDP-TAILSCALE-24H
+name: RDP-TAILSCALE-AUTO
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 */5 * * *"     # safety auto-restart every 5 hours
 
 jobs:
   rdp:
     runs-on: windows-latest
-    timeout-minutes: 350     # keep under 360 to allow auto-rerun
+    timeout-minutes: 350
 
     steps:
 
-      - name: Enable RDP (Tailscale Only)
+      - name: Enable RDP
         shell: powershell
         run: |
           Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0 -Force
-
-          # Remove old rule
           netsh advfirewall firewall delete rule name="RDP-Allow" > $null 2>&1
-
-          # ALLOW RDP ONLY THROUGH TAILSCALE INTERFACE
           netsh advfirewall firewall add rule name="RDP-Allow" dir=in action=allow protocol=TCP localport=3389 remoteip=100.0.0.0/8
-
           Restart-Service TermService -Force
 
       - name: Create RDP User
@@ -30,7 +23,6 @@ jobs:
         run: |
           $chars = ([char[]](33..126))
           $password = -join (1..18 | ForEach-Object { $chars | Get-Random })
-
           $secure = ConvertTo-SecureString $password -AsPlainText -Force
 
           if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
@@ -39,52 +31,39 @@ jobs:
             Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
           }
 
-          echo "RDP_USER=RDP" >> $env:GITHUB_ENV
           echo "RDP_PASS=$password" >> $env:GITHUB_ENV
 
-      - name: Install Tailscale
+      - name: Install Tailscale if missing
         shell: powershell
         run: |
-          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
-          $path = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest $url -OutFile $path
-          Start-Process msiexec.exe -ArgumentList "/i `"$path`" /quiet /norestart" -Wait
+          if (-not (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe")) {
+            $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+            $path = "$env:TEMP\tailscale.msi"
+            Invoke-WebRequest $url -OutFile $path
+            Start-Process msiexec.exe -ArgumentList "/i `"$path`" /quiet /norestart" -Wait
+          }
 
-      - name: Connect Tailscale
+      - name: Keep Tailscale Connected
         shell: powershell
         run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
-            --authkey ${{ secrets.TAILSCALE_AUTH_KEY }} `
-            --hostname "github-rdp" `
-            --accept-routes `
-            --accept-dns `
-            --reset
+          while ($true) {
+            try {
+              $tsStatus = & "$env:ProgramFiles\Tailscale\tailscale.exe" status
+              if ($tsStatus -notmatch "100\.\d+\.\d+\.\d+") {
+                Write-Host "Tailscale not connected. Reconnecting..."
+                & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey ${{ secrets.TAILSCALE_MACHINE_KEY }} --hostname github-static-rdp --accept-routes --accept-dns --reset
+              }
+            } catch {
+              Write-Host "Error detected. Re-running Tailscale..."
+              & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey ${{ secrets.TAILSCALE_MACHINE_KEY }} --hostname github-static-rdp --accept-routes --accept-dns --reset
+            }
 
-          Start-Sleep 5
+            # Get current IP
+            $ip = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4).Trim()
+            if ($ip) {
+              echo "TS_IP=$ip" >> $env:GITHUB_ENV
+              Write-Host "Tailscale IP: $ip"
+            }
 
-          $ip = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4).Trim()
-          if (-not $ip) { Write-Error "No Tailscale IP!" ; exit 1 }
-
-          echo "TS_IP=$ip" >> $env:GITHUB_ENV
-
-      - name: Print Login Info
-        shell: powershell
-        run: |
-          Write-Host "=============================="
-          Write-Host "     GITHUB WINDOWS VPS"
-          Write-Host "=============================="
-          Write-Host "Tailscale IP : $env:TS_IP"
-          Write-Host "Username     : $env:RDP_USER"
-          Write-Host "Password     : $env:RDP_PASS"
-          Write-Host "=============================="
-
-      - name: Keep Alive + Auto-Restart
-        shell: powershell
-        run: |
-          $limit = 32400   # keep alive for 9 hours (job restarts earlier via cron)
-          $i = 0
-          while ($i -lt $limit) {
-            Write-Host "[$(Get-Date)] VPS Running..."
             Start-Sleep -Seconds 30
-            $i += 30
           }
