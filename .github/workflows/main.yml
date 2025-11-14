@@ -1,0 +1,90 @@
+name: RDP-TAILSCALE-24H
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */5 * * *"     # safety auto-restart every 5 hours
+
+jobs:
+  rdp:
+    runs-on: windows-latest
+    timeout-minutes: 350     # keep under 360 to allow auto-rerun
+
+    steps:
+
+      - name: Enable RDP (Tailscale Only)
+        shell: powershell
+        run: |
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0 -Force
+
+          # Remove old rule
+          netsh advfirewall firewall delete rule name="RDP-Allow" > $null 2>&1
+
+          # ALLOW RDP ONLY THROUGH TAILSCALE INTERFACE
+          netsh advfirewall firewall add rule name="RDP-Allow" dir=in action=allow protocol=TCP localport=3389 remoteip=100.0.0.0/8
+
+          Restart-Service TermService -Force
+
+      - name: Create RDP User
+        shell: powershell
+        run: |
+          $chars = ([char[]](33..126))
+          $password = -join (1..18 | ForEach-Object { $chars | Get-Random })
+
+          $secure = ConvertTo-SecureString $password -AsPlainText -Force
+
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name "RDP" -Password $secure -AccountNeverExpires
+            Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          }
+
+          echo "RDP_USER=RDP" >> $env:GITHUB_ENV
+          echo "RDP_PASS=$password" >> $env:GITHUB_ENV
+
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $path = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest $url -OutFile $path
+          Start-Process msiexec.exe -ArgumentList "/i `"$path`" /quiet /norestart" -Wait
+
+      - name: Connect Tailscale
+        shell: powershell
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+            --authkey ${{ secrets.TAILSCALE_AUTH_KEY }} `
+            --hostname "github-rdp" `
+            --accept-routes `
+            --accept-dns `
+            --reset
+
+          Start-Sleep 5
+
+          $ip = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4).Trim()
+          if (-not $ip) { Write-Error "No Tailscale IP!" ; exit 1 }
+
+          echo "TS_IP=$ip" >> $env:GITHUB_ENV
+
+      - name: Print Login Info
+        shell: powershell
+        run: |
+          Write-Host "=============================="
+          Write-Host "     GITHUB WINDOWS VPS"
+          Write-Host "=============================="
+          Write-Host "Tailscale IP : $env:TS_IP"
+          Write-Host "Username     : $env:RDP_USER"
+          Write-Host "Password     : $env:RDP_PASS"
+          Write-Host "=============================="
+
+      - name: Keep Alive + Auto-Restart
+        shell: powershell
+        run: |
+          $limit = 32400   # keep alive for 9 hours (job restarts earlier via cron)
+          $i = 0
+          while ($i -lt $limit) {
+            Write-Host "[$(Get-Date)] VPS Running..."
+            Start-Sleep -Seconds 30
+            $i += 30
+          }
